@@ -1,0 +1,16 @@
+# Never committed (2026-10-28): secrets and keys, Obsidian's plugin settings (data.json can hold keys and paths),
+# logs, editor and assistant folders, local builds.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+data.json
+*.log
+.vscode/
+.claude/
+target/
+node_modules/
+.DS_Store
+Thumbs.db

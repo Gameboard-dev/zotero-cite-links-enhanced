@@ -1,0 +1,10 @@
+{
+  "id": "zotero-cite-links",
+  "name": "Zotero Cite Links",
+  "version": "0.2.0",
+  "minAppVersion": "1.4.0",
+  "description": "Cmd-click a Pandoc @citekey in your notes to open the cited PDF in Zotero at the page locator from the citation.",
+  "author": "jpeacock29",
+  "authorUrl": "https://github.com/jpeacock29",
+  "isDesktopOnly": true
+}

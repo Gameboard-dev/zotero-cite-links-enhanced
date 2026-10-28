@@ -1,0 +1,10 @@
+{
+  "id": "zotero-cite-links-enhanced",
+  "name": "Zotero Cite Links Enhanced",
+  "version": "0.2.0-enhanced.2",
+  "minAppVersion": "1.4.0",
+  "description": "Ctrl-click or Cmd-click a Pandoc citation key to open the cited PDF in Zotero at the page printed in the source, or hover with Ctrl or Cmd held to see its bibliography entry. A fork of Zotero Cite Links.",
+  "author": "jpeacock29; fork by Gameboard-dev",
+  "authorUrl": "https://github.com/jpeacock29",
+  "isDesktopOnly": true
+}

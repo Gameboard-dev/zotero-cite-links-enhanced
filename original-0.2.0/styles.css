@@ -1,0 +1,32 @@
+.zcl-cite {
+  color: var(--text-normal);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-decoration-color: var(--text-faint);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* Solid underline + pointer cursor only while the click modifier is held
+   AND the cursor is over a citekey — the body class is toggled from
+   keydown/keyup listeners in main.js. */
+body.zcl-mod-held .zcl-cite:hover {
+  cursor: pointer;
+  text-decoration-style: solid;
+  text-decoration-color: var(--text-muted);
+}
+
+/* Obsidian renders `[text]` (no following URL) as a "barelink" with link
+   color and a hover underline. Suppress both. !important is needed because
+   Obsidian's rule is scoped under .markdown-source-view.mod-cm6 (specificity
+   0,3,0) which beats single-class selectors. */
+.cm-hmd-barelink,
+.cm-hmd-barelink.cm-link {
+  color: var(--text-normal) !important;
+  text-decoration: none !important;
+}
+
+.cm-hmd-barelink:hover,
+.cm-hmd-barelink.cm-link:hover {
+  text-decoration: none !important;
+}

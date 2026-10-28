@@ -1,0 +1,64 @@
+diff --git a/obsidian-plugins/zotero-cite-links/original-0.2.0/main.js b/obsidian-plugins/zotero-cite-links/main.js
+index a507c58..ac890ed 100644
+--- a/obsidian-plugins/zotero-cite-links/original-0.2.0/main.js
++++ b/obsidian-plugins/zotero-cite-links/main.js
+@@ -76,6 +76,21 @@ function computePageParam(annotations, requestedPage) {
+   return String(requestedPage);
+ }
+ 
++// Local change (2026-10-23): a locator is the page number printed in the source. Zotero's open-pdf `page` parameter is the PDF's
++// page (pageIndex + 1), so the printed page is translated with the page markers of the paper's compiled note in this vault,
++// `<!-- page 291 (310 / 360) -->` (printed label, then PDF page / pages). The note is found by its `zotero_pdf` property,
++// which is the attachment's open-pdf address, or else by its `citekey`.
++const PAGE_MARKER_RX = /<!--\s*page\s+([^\s(\/]+)\s*\(\s*(\d+)\s*\/\s*\d+\s*\)\s*-->/g;
++
++function pdfPageFromMarkers(text, requestedPage) {
++  PAGE_MARKER_RX.lastIndex = 0;
++  let m;
++  while ((m = PAGE_MARKER_RX.exec(text)) !== null) {
++    if (m[1] === String(requestedPage)) return m[2];
++  }
++  return null;
++}
++
+ function extractLocator(text, after) {
+   const tail = text.slice(after, after + 80);
+   const m = tail.match(LOCATOR_RX);
+@@ -222,12 +237,36 @@ module.exports = class ZoteroCiteLinks extends Plugin {
+     return { openUrl: selectUrl, annotations: null };
+   }
+ 
++  findNote(openUrl, citekey) {
++    const wantedAtt = (openUrl.match(/items\/([A-Z0-9]+)/) || [])[1];
++    let byKey = null;
++    for (const file of this.app.vault.getMarkdownFiles()) {
++      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
++      if (!fm) continue;
++      const pdf = typeof fm.zotero_pdf === 'string' ? fm.zotero_pdf : '';
++      if (wantedAtt && pdf.endsWith(`/items/${wantedAtt}`)) return file;
++      if (!byKey && fm.citekey === citekey) byKey = file;
++    }
++    return byKey;
++  }
++
++  async pageFromNote(openUrl, citekey, page) {
++    if (!page) return null;
++    const file = this.findNote(openUrl, citekey);
++    if (!file) return null;
++    try {
++      return pdfPageFromMarkers(await this.app.vault.cachedRead(file), page);
++    } catch {
++      return null;
++    }
++  }
++
+   async openCitation(citekey, page) {
+     if (!citekey) return;
+     const { openUrl, annotations } = await this.resolveOpenUrl(citekey);
+     let finalUrl = openUrl;
+     if (openUrl.includes('open-pdf')) {
+-      const pageParam = computePageParam(annotations, page);
++      const pageParam = (await this.pageFromNote(openUrl, citekey, page)) || computePageParam(annotations, page);
+       if (pageParam) finalUrl = `${openUrl}?page=${pageParam}`;
+     }
+     window.open(finalUrl);
