@@ -17,11 +17,11 @@ The fork turns the printed page into the PDF page with the page markers of the p
 ## Citation pop-ups
 
 - **Trigger.** Hold Ctrl (Cmd on macOS) and point at a citation, in the editor or in Reading view. The pop-up shows the citation's bibliography entry as a table: the entry's type and key, then each field's name and value. Pressing Ctrl/Cmd while the pointer already rests on a citation shows the pop-up too. Ctrl/Cmd+click still opens the citation in Zotero as before.
-- **Where the entry comes from.** First from the `.bib` files in the vault (every `.bib` file; when two hold the same key, the most recently changed one wins; a file is read again when it changes). A key that no `.bib` file holds is asked of Zotero on this computer through Better BibTeX (its JSON-RPC method `item.export` with the Better BibLaTeX translator, on `127.0.0.1` at the port set in the settings), so no exported `.bib` file is needed. If Zotero is not running, the pop-up says so.
+- **Where the entry comes from.** From Zotero on this computer, through Better BibTeX (its JSON-RPC method `item.export` with the Better BibLaTeX translator, on `127.0.0.1` at the port set in the settings), so no exported `.bib` file is needed. An entry is kept for five minutes, then asked for again, so edits in Zotero show. Only when Zotero does not answer (not running, or Better BibTeX missing) is the key looked up in the vault's `.bib` files, if there are any (every `.bib` file, wherever it is; when two hold the same key, the most recently changed one wins). If neither has it, the pop-up says why.
 - **Selecting text.** The pop-up stays open while the pointer is over it, and for a moment after the pointer leaves the citation or the key is released, so the pointer can move into it. Its text can be selected and copied. Escape closes it.
-- **Copy shortcut.** Ctrl/Cmd+Shift+C copies the whole entry shown, as found (BibLaTeX when it came from Zotero).
+- **Copy shortcut.** While the pop-up is open, Ctrl/Cmd+Shift+C copies the whole entry shown, as BibLaTeX source (as written in the `.bib` file when it came from one). The pop-up itself shows only the entry.
 - **Setting.** *Citation pop-ups* (on by default) turns the feature on or off.
-- **Requirements.** For keys that are not in a `.bib` file in the vault: Zotero running on the same computer with the [Better BibTeX](https://retorque.re/zotero-better-bibtex/) extension installed. Entries from the vault's `.bib` files need neither.
+- **Requirements.** Zotero running on the same computer with the [Better BibTeX](https://retorque.re/zotero-better-bibtex/) extension installed. Without them, only keys held in a `.bib` file in the vault are shown.
 
 ## Files
 

@@ -56,6 +56,4 @@ body.zcl-mod-held .zcl-cite:hover {
 .zcl-bib-popover .zcl-bib-field { white-space: nowrap; color: var(--text-accent); }
 .zcl-bib-popover .zcl-bib-value { color: var(--text-normal); overflow-wrap: anywhere; }
 .zcl-bib-popover .zcl-bib-raw { margin: 0; white-space: pre-wrap; }
-.zcl-bib-popover .zcl-bib-source,
 .zcl-bib-popover .zcl-bib-message { color: var(--text-muted); white-space: normal; }
-.zcl-bib-popover .zcl-bib-source { margin-top: var(--size-4-2); font-size: var(--font-smallest); }

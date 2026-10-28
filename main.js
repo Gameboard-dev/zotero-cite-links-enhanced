@@ -13,6 +13,8 @@ const BBT_PATH = '/better-bibtex/json-rpc';
 const RPC_TIMEOUT_MS = 2000;
 // An export can take Zotero longer than a lookup.
 const EXPORT_TIMEOUT_MS = 10000;
+// how long an entry fetched from Zotero is reused before it is asked for again (so edits in Zotero show)
+const FETCHED_FOR_MS = 5 * 60 * 1000;
 const EXPORT_TRANSLATOR = 'Better BibLaTeX';
 // How long a citation pop-up stays after the pointer leaves its citation (or the modifier is released), so that the
 // pointer can cross to it; inside the pop-up it stays until the pointer leaves.
@@ -665,7 +667,7 @@ module.exports = class ZoteroCiteLinks extends Plugin {
         missing: 'Zotero does not know this key either.',
         failed: 'The lookup failed (see the developer console).',
       }[found.error] || '';
-      pop.createDiv({ cls: 'zcl-bib-message', text: `@${key}: no .bib file in the vault holds it. ${why}` });
+      pop.createDiv({ cls: 'zcl-bib-message', text: `@${key}: no entry found. ${why}` });
       return;
     }
     const parsed = bibFields(found.text);
@@ -681,20 +683,21 @@ module.exports = class ZoteroCiteLinks extends Plugin {
         row.createEl('td', { cls: 'zcl-bib-value', text: value });
       }
     }
-    const mod = Platform.isMacOS ? 'Cmd' : 'Ctrl';
-    pop.createDiv({ cls: 'zcl-bib-source', text: `From ${found.from}. ${mod}+Shift+C copies the entry.` });
   }
 
-  // The entry of `key`: { text, from } from the vault's .bib files, else from Zotero; or { error: 'down' | 'missing' }.
+  // The entry of `key`: { text, from } from Zotero (Better BibTeX), which needs no .bib file; only when Zotero does not
+  // answer, from a .bib file in the vault, if one holds the key (any .bib, wherever it is); or { error: 'down' | 'missing' }.
   async bibEntry(key) {
-    await this.readVaultBibs();
-    const local = this.bibVault.get(key);
-    if (local) return local;
     const cached = this.bibFetched.get(key);
-    if (cached) return cached;
+    if (cached && Date.now() - cached.at < FETCHED_FOR_MS) return cached;
     const found = await this.exportFromZotero(key);
-    if (found.text) this.bibFetched.set(key, found);
-    return found;
+    if (found.text) {
+      this.bibFetched.set(key, { ...found, at: Date.now() });
+      return found;
+    }
+    if (found.error !== 'down') return found;
+    await this.readVaultBibs();
+    return this.bibVault.get(key) || found;
   }
 
   // Every .bib file in the vault, read again when one is added, removed or changed; the newest file's entry wins.
