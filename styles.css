@@ -7,10 +7,12 @@
   text-underline-offset: 3px;
 }
 
-/* Solid underline + pointer cursor only while the click modifier is held
-   AND the cursor is over a citekey — the body class is toggled from
-   keydown/keyup listeners in main.js. */
-body.zcl-mod-held .zcl-cite:hover {
+/* Solid underline + pointer cursor while the cursor is over a citekey that a
+   click opens: Ctrl/Cmd held (Zotero), or a plain click when Source notes is
+   on (the source's note). The body classes are toggled from keydown/keyup
+   listeners in main.js. */
+body.zcl-mod-held .zcl-cite:hover,
+body.zcl-note-click .zcl-cite:hover {
   cursor: pointer;
   text-decoration-style: solid;
   text-decoration-color: var(--text-muted);

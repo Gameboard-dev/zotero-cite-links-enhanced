@@ -1,6 +1,6 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, Notice, MarkdownView, Platform } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, MarkdownView, Platform, TFile } = require('obsidian');
 const { Decoration, ViewPlugin } = require('@codemirror/view');
 const { RangeSetBuilder } = require('@codemirror/state');
 const { syntaxTree, tokenClassNodeProp } = require('@codemirror/language');
@@ -20,10 +20,19 @@ const EXPORT_TRANSLATOR = 'Better BibLaTeX';
 // pointer can cross to it; inside the pop-up it stays until the pointer leaves.
 const POPUP_GRACE_MS = 600;
 
+// The hover source registered with Obsidian's Page preview for Ctrl/Cmd + hover over a citation (preview choice "Library note").
+const NOTE_PREVIEW_SOURCE = 'zotero-cite-links-enhanced';
+// Better BibTeX looks up a whole list of keys in one call; a long list can take Zotero a while.
+const LOOKUP_TIMEOUT_MS = 30000;
+
 const DEFAULT_SETTINGS = {
   zoteroPort: 23119,
-  modifier: 'mod',
   hoverPopup: true,
+  // what Ctrl/Cmd + hover shows: 'bib' (the bibliography entry) or 'note' (the source's note, at the page cited)
+  previewChoice: 'bib',
+  sourceNotes: true,
+  danglingSkip: '',
+  danglingReport: 'Dangling citation keys.md',
 };
 
 // Node `http` is used (not Obsidian's `requestUrl`) because Better BibTeX's
@@ -236,6 +245,124 @@ function pdfPageFromMarkers(text, requestedPage) {
   return null;
 }
 
+// ---- Source notes (a click without Ctrl/Cmd; Ctrl/Cmd + hover when the preview choice is the note) ----
+
+// A page marker on a line of its own, read for its label: `<!-- page 204 (214 / 595) -->` (printed label, then PDF page /
+// pages) gives `204`; `<!-- page 3 / 9 -->` (no printed labels) gives `3`.
+const NOTE_PAGE_RX = /^\s*<!--\s*page\s+([^\s(\/]+)\s*(?:\(\s*\d+\s*\/\s*\d+\s*\)|\/\s*\d+)\s*-->/;
+
+// The 0-based line of the marker of `page` in a note's text, or -1.
+function markerLine(text, page) {
+  const wanted = String(page);
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].indexOf('<!--') < 0) continue;
+    const m = NOTE_PAGE_RX.exec(lines[i]);
+    if (m && m[1] === wanted) return i;
+  }
+  return -1;
+}
+
+// ---- Dangling keys ----
+
+// Where a citation may start, as Pandoc reads one: at the start of a line, or after white space, `[`, `;`, `-` (author
+// suppressed) or `(`. This keeps out addresses such as `medium.com/@name`, which the editor's underline (CITE_RX alone)
+// does not need to.
+const CITE_BEFORE = /[\s\[;\-(]/;
+
+// The text of a note with what cannot hold a citation blanked to spaces, so that columns and line numbers are kept:
+// the properties block, fenced code and `$$` math blocks, inline code and inline `$…$` math.
+function citableText(text) {
+  const lines = text.split('\n');
+  let fence = null;
+  let math = false;
+  let i = 0;
+  if (lines[0] !== undefined && lines[0].trim() === '---') {
+    for (let j = 1; j < lines.length; j++) {
+      if (lines[j].trim() === '---' || lines[j].trim() === '...') { i = j + 1; break; }
+    }
+    for (let j = 0; j < i; j++) lines[j] = '';
+  }
+  for (; i < lines.length; i++) {
+    const line = lines[i];
+    const t = line.trimStart();
+    if (fence) {
+      if (t.startsWith(fence)) fence = null;
+      lines[i] = '';
+      continue;
+    }
+    const f = /^(`{3,}|~{3,})/.exec(t);
+    if (f) { fence = f[1]; lines[i] = ''; continue; }
+    const dollars = (line.match(/\$\$/g) || []).length;
+    if (math) {
+      if (dollars % 2 === 1) math = false;
+      lines[i] = '';
+      continue;
+    }
+    if (dollars % 2 === 1) { math = true; lines[i] = ''; continue; }
+    lines[i] = line
+      .replace(/(`+)[\s\S]*?\1/g, (s) => ' '.repeat(s.length))
+      .replace(/\$\$[^$]*\$\$/g, (s) => ' '.repeat(s.length))
+      .replace(/(?<![\\$])\$(?=\S)[^$\n]*?(?<=\S)(?<!\\)\$(?!\d)/g, (s) => ' '.repeat(s.length));
+  }
+  return lines;
+}
+
+// Every citation in a note: { key, line } with 1-based lines.
+function citationsIn(text) {
+  const out = [];
+  const lines = citableText(text);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.indexOf('@') < 0) continue;
+    CITE_RX.lastIndex = 0;
+    let m;
+    while ((m = CITE_RX.exec(line)) !== null) {
+      if (m.index > 0 && !CITE_BEFORE.test(line[m.index - 1])) continue;
+      out.push({ key: m[1], line: i + 1 });
+    }
+  }
+  return out;
+}
+
+// The folders to skip, one per line (or separated by commas), as vault paths without slashes at either end.
+function skipFolders(setting) {
+  return String(setting || '')
+    .split(/[\n,]/)
+    .map((s) => s.trim().replace(/^\/+|\/+$/g, ''))
+    .filter(Boolean);
+}
+
+function inFolders(path, folders) {
+  return folders.some((f) => path === f || path.startsWith(`${f}/`));
+}
+
+// The report note's text. `missing` maps each key with no item to [{ path, lines }]; `ambiguous` maps a key Zotero matched
+// to several items to the number of items.
+function danglingReport({ missing, ambiguous, checkedWith, keys, notes, when }) {
+  const out = ['# Dangling citation keys', ''];
+  out.push(`Checked ${when} against ${checkedWith}: ${keys} distinct keys cited in ${notes} notes, ${missing.size} with no item.`);
+  out.push('Each key is followed by the notes that cite it and the lines where it is cited. This note is written again each time the command runs.');
+  out.push('');
+  const keys1 = [...missing.keys()].sort((a, b) => a.localeCompare(b));
+  if (!keys1.length) out.push('Every cited key has an item.');
+  for (const key of keys1) {
+    out.push(`## @${key}`, '');
+    for (const { path, lines } of missing.get(key)) {
+      const name = path.replace(/^.*\//, '').replace(/\.md$/, '');
+      const link = path.replace(/\.md$/, '');
+      out.push(`- [[${link}|${name}]], line${lines.length > 1 ? 's' : ''} ${lines.join(', ')}`);
+    }
+    out.push('');
+  }
+  if (ambiguous.size) {
+    out.push('## Keys matched by more than one item', '');
+    for (const [key, n] of [...ambiguous].sort((a, b) => a[0].localeCompare(b[0]))) out.push(`- @${key}: ${n} items`);
+    out.push('');
+  }
+  return out.join('\n');
+}
+
 function extractLocator(text, after) {
   const tail = text.slice(after, after + 80);
   const m = tail.match(LOCATOR_RX);
@@ -317,6 +444,43 @@ module.exports = class ZoteroCiteLinks extends Plugin {
     this.registerDomEvent(document, 'keydown', this.onBibKeyDown, { capture: true });
     this.registerDomEvent(document, 'keyup', this.onBibKeyUp);
 
+    // Source notes: a click without Ctrl/Cmd opens the cited source's note at the page (from the vault alone, so
+    // Zotero need not be running); Ctrl/Cmd + hover previews it when the preview choice is the note.
+    this.noteIndex = null;
+    this.previewEl = null;
+    this.lastPointerEvent = null;
+    this.hoverParent = { hoverPopover: null };
+    this.registerHoverLinkSource(NOTE_PREVIEW_SOURCE, {
+      // the plugin itself waits for Ctrl/Cmd (the pointer's last event may predate the key press)
+      display: 'Zotero Cite Links Enhanced (Ctrl/Cmd + hover over a citation)',
+      defaultMod: false,
+    });
+    const dropIndex = () => { this.noteIndex = null; };
+    this.registerEvent(this.app.metadataCache.on('changed', dropIndex));
+    this.registerEvent(this.app.metadataCache.on('resolved', dropIndex));
+    this.registerEvent(this.app.vault.on('rename', dropIndex));
+    this.registerEvent(this.app.vault.on('delete', dropIndex));
+
+    this.addCommand({
+      id: 'open-note-at-cursor',
+      name: 'Open the note of the citation at the cursor',
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view) return false;
+        if (!checking) {
+          const hit = this.citationAtCursor(view);
+          if (hit) this.openSourceNote(hit.key, hit.page);
+        }
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: 'list-dangling-keys',
+      name: 'List dangling citation keys (cited, but with no item in Zotero)',
+      callback: () => this.listDanglingKeys(),
+    });
+
     this.addCommand({
       id: 'open-at-cursor',
       name: 'Open citation at cursor in Zotero',
@@ -339,7 +503,7 @@ module.exports = class ZoteroCiteLinks extends Plugin {
   }
 
   onunload() {
-    document.body.classList.remove('zcl-mod-held');
+    document.body.classList.remove('zcl-mod-held', 'zcl-note-click');
     this.hideBibPopup();
   }
 
@@ -475,32 +639,48 @@ module.exports = class ZoteroCiteLinks extends Plugin {
     }
   }
 
+  // Ctrl/Cmd + click opens the citation in Zotero.
   isOpenModifier(evt) {
-    if (this.settings.modifier === 'none') return true;
     return Platform.isMacOS ? evt.metaKey : evt.ctrlKey;
   }
 
   syncModClass = (evt) => {
-    const held = this.settings.modifier === 'none' || (evt && this.isOpenModifier(evt));
+    const held = !!(evt && this.isOpenModifier(evt));
     document.body.classList.toggle('zcl-mod-held', held);
+    document.body.classList.toggle('zcl-note-click', this.settings.sourceNotes && !held);
   };
 
   clearModClass = () => {
-    document.body.classList.toggle('zcl-mod-held', this.settings.modifier === 'none');
+    document.body.classList.remove('zcl-mod-held');
+    document.body.classList.toggle('zcl-note-click', this.settings.sourceNotes);
   };
 
+  // The citation under the pointer: an underlined key, or (in Reading view) a citation written as a link,
+  // [[@key, p. 4]], which Obsidian draws as an internal link.
   hitFromTarget(target) {
-    if (!(target instanceof Element)) return null;
-    const el = target.closest('.zcl-cite[data-citekey]');
+    const el = this.citeElFromTarget(target);
     if (!el) return null;
-    const key = el.getAttribute('data-citekey');
-    const page = el.getAttribute('data-page') || null;
-    return key ? { key, page } : null;
+    if (el.classList.contains('zcl-cite')) {
+      const key = el.getAttribute('data-citekey');
+      const page = el.getAttribute('data-page') || null;
+      return key ? { key, page } : null;
+    }
+    const href = el.getAttribute('data-href') || '';
+    CITE_RX.lastIndex = 0;
+    const m = CITE_RX.exec(href);
+    if (!m || m.index !== 0) return null;
+    return { key: m[1], page: extractLocator(href, m[0].length) };
   }
 
+  citeElFromTarget(target) {
+    if (!(target instanceof Element)) return null;
+    return target.closest('.zcl-cite[data-citekey], a.internal-link[data-href^="@"]');
+  }
+
+  // A click without Ctrl/Cmd opens the note; Ctrl/Cmd + click opens Zotero.
   onMouseDown = (evt) => {
     if (evt.button !== 0) return;
-    if (!this.isOpenModifier(evt)) return;
+    if (!this.isNoteModifier(evt) && !this.isOpenModifier(evt)) return;
     if (!this.hitFromTarget(evt.target)) return;
     evt.preventDefault();
     evt.stopPropagation();
@@ -508,15 +688,23 @@ module.exports = class ZoteroCiteLinks extends Plugin {
 
   onClick = (evt) => {
     if (evt.button !== 0) return;
-    if (!this.isOpenModifier(evt)) return;
+    const note = this.isNoteModifier(evt);
+    if (!note && !this.isOpenModifier(evt)) return;
     const hit = this.hitFromTarget(evt.target);
     if (!hit) return;
     evt.preventDefault();
     evt.stopPropagation();
-    this.openCitation(hit.key, hit.page);
+    if (note) this.openSourceNote(hit.key, hit.page);
+    else this.openCitation(hit.key, hit.page);
   };
 
   openAtCursor(view) {
+    const hit = this.citationAtCursor(view);
+    if (hit) this.openCitation(hit.key, hit.page);
+  }
+
+  // The citation at (or just before) the cursor, with its page, or null (and a notice).
+  citationAtCursor(view) {
     const editor = view.editor;
     const cursor = editor.getCursor();
     const line = editor.getLine(cursor.line);
@@ -533,10 +721,224 @@ module.exports = class ZoteroCiteLinks extends Plugin {
     }
     if (!chosen) {
       new Notice('No @citekey near cursor.');
+      return null;
+    }
+    return { key: chosen.key, page: extractLocator(line, chosen.end) };
+  }
+
+  // ---- Source notes ----
+
+  // A click without Ctrl/Cmd (which belong to opening in Zotero) or Alt (the editor's extra cursor).
+  isNoteModifier(evt) {
+    return this.settings.sourceNotes && !evt.ctrlKey && !evt.metaKey && !evt.altKey;
+  }
+
+  // The notes whose `citekey` property is `key`, by path. The index is built when first needed and dropped whenever a
+  // note's properties change or a note is renamed or deleted.
+  notesFor(key) {
+    if (!this.noteIndex) {
+      const index = new Map();
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        const ck = this.app.metadataCache.getFileCache(file)?.frontmatter?.citekey;
+        if (typeof ck !== 'string' || !ck) continue;
+        if (!index.has(ck)) index.set(ck, []);
+        index.get(ck).push(file);
+      }
+      for (const list of index.values()) list.sort((a, b) => a.path.localeCompare(b.path));
+      this.noteIndex = index;
+    }
+    return this.noteIndex.get(key) || [];
+  }
+
+  // A source's main note: the only one, or else the one that links to most of the others (a long source's contents
+  // note), or else the first by path.
+  mainNote(files) {
+    if (files.length === 1) return files[0];
+    const paths = new Set(files.map((f) => f.path));
+    let best = null;
+    let most = 0;
+    for (const f of files) {
+      const links = this.app.metadataCache.resolvedLinks[f.path] || {};
+      const n = Object.keys(links).filter((p) => p !== f.path && paths.has(p)).length;
+      if (n > most) { best = f; most = n; }
+    }
+    return best || files[0];
+  }
+
+  // Where a citation leads in the vault: { file, line } (line 0-based, or null for the top), with `pageMissing` when a
+  // page was asked for and no note marks it; or null when no note has the key.
+  async noteTarget(key, page) {
+    const files = this.notesFor(key);
+    if (!files.length) return null;
+    if (page) {
+      for (const file of files) {
+        let text;
+        try { text = await this.app.vault.cachedRead(file); } catch { continue; }
+        const line = markerLine(text, page);
+        if (line >= 0) return { file, line };
+      }
+    }
+    return { file: this.mainNote(files), line: null, pageMissing: !!page };
+  }
+
+  // Opens the cited source's note at the page: in the tab that shows it already, or else in a new tab, so the note
+  // being read stays open.
+  async openSourceNote(key, page) {
+    const t = await this.noteTarget(key, page);
+    if (!t) {
+      new Notice(`@${key}: no note in the vault has the citekey property "${key}".`);
       return;
     }
-    const page = extractLocator(line, chosen.end);
-    this.openCitation(chosen.key, page);
+    if (t.pageMissing) new Notice(`@${key}: no note marks page ${page}; the source's main note is open instead.`);
+    const shown = this.app.workspace.getLeavesOfType('markdown').find((l) => l.view?.file?.path === t.file.path);
+    const leaf = shown || this.app.workspace.getLeaf('tab');
+    if (shown) this.app.workspace.setActiveLeaf(shown, { focus: true });
+    else await leaf.openFile(t.file, { active: true });
+    if (t.line === null) return;
+    const view = leaf.view;
+    if (!(view instanceof MarkdownView)) return;
+    const pos = { line: t.line, ch: 0 };
+    if (view.getMode() === 'source') {
+      view.editor.setCursor(pos);
+      view.editor.scrollIntoView({ from: pos, to: pos }, true);
+    } else {
+      view.previewMode?.applyScroll?.(t.line);
+    }
+  }
+
+  // Ctrl/Cmd + hover (preview choice "Library note"): the note shown by Obsidian's Page preview, scrolled to the page.
+  async previewSourceNote(el, evt) {
+    if (this.previewEl === el) return;
+    this.previewEl = el;
+    const hit = this.hitFromTarget(el);
+    if (!hit) return;
+    const t = await this.noteTarget(hit.key, hit.page);
+    // the pointer left, or moved to another citation, during the lookup
+    if (this.previewEl !== el || !t) return;
+    this.app.workspace.trigger('hover-link', {
+      event: evt,
+      source: NOTE_PREVIEW_SOURCE,
+      hoverParent: this.hoverParent,
+      targetEl: el,
+      linktext: t.file.path,
+      sourcePath: '',
+      state: t.line === null ? undefined : { scroll: t.line },
+    });
+  }
+
+  // ---- Dangling keys ----
+
+  // Which of `keys` Zotero has no item for, across My Library and the group libraries:
+  // { missing: Set, ambiguous: Map(key → items), checkedWith } or { error }.
+  async keysWithoutItems(keys) {
+    const port = this.settings.zoteroPort;
+    let left = keys;
+    const ambiguous = new Map();
+    const libraries = this.libraryNames.length ? this.libraryNames : ['My Library'];
+    for (const lib of libraries) {
+      if (!left.length) break;
+      const r = await bbtCall(port, 'item.pandoc_filter', [left, true, lib], LOOKUP_TIMEOUT_MS);
+      if (r.down) return this.keysWithoutBibEntries(keys);
+      if (r.error || !r.result || typeof r.result !== 'object') {
+        return { error: `Better BibTeX answered with an error: ${r.error ? JSON.stringify(r.error) : 'no result'}` };
+      }
+      const errors = r.result.errors || {};
+      const next = [];
+      for (const key of left) {
+        if (!(key in errors)) continue;
+        const n = Number(errors[key]);
+        if (n > 1) ambiguous.set(key, n);
+        else next.push(key);
+      }
+      left = next;
+    }
+    return { missing: new Set(left), ambiguous, checkedWith: 'Zotero (Better BibTeX)' };
+  }
+
+  // When Zotero does not answer: the keys that no .bib file in the vault holds.
+  async keysWithoutBibEntries(keys) {
+    const bibs = this.app.vault.getFiles().filter((f) => f.extension === 'bib');
+    if (!bibs.length) {
+      return { error: 'Zotero is not running (or Better BibTeX did not answer), and the vault holds no .bib file to check against.' };
+    }
+    await this.readVaultBibs();
+    return {
+      missing: new Set(keys.filter((k) => !this.bibVault.has(k))),
+      ambiguous: new Map(),
+      checkedWith: `the vault's .bib files (${bibs.map((f) => f.path).join(', ')}), because Zotero did not answer`,
+    };
+  }
+
+  async listDanglingKeys() {
+    const skip = skipFolders(this.settings.danglingSkip);
+    const reportPath = String(this.settings.danglingReport || DEFAULT_SETTINGS.danglingReport).trim().replace(/^\/+/, '');
+    const notice = new Notice('Listing dangling citation keys…', 0);
+    try {
+      const where = new Map();
+      let notes = 0;
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        if (file.path === reportPath || inFolders(file.path, skip)) continue;
+        let text;
+        try { text = await this.app.vault.cachedRead(file); } catch { continue; }
+        if (text.indexOf('@') < 0) continue;
+        const cites = citationsIn(text);
+        if (!cites.length) continue;
+        notes++;
+        for (const { key, line } of cites) {
+          if (!where.has(key)) where.set(key, new Map());
+          const byNote = where.get(key);
+          if (!byNote.has(file.path)) byNote.set(file.path, []);
+          const lines = byNote.get(file.path);
+          if (lines[lines.length - 1] !== line) lines.push(line);
+        }
+      }
+      const keys = [...where.keys()];
+      if (!keys.length) {
+        new Notice('No citations found in the notes checked.');
+        return;
+      }
+      const found = await this.keysWithoutItems(keys);
+      if (found.error) {
+        new Notice(`Dangling citation keys: ${found.error}`, 10000);
+        return;
+      }
+      const missing = new Map();
+      for (const key of found.missing) {
+        const byNote = [...where.get(key)].sort((a, b) => a[0].localeCompare(b[0]));
+        missing.set(key, byNote.map(([path, lines]) => ({ path, lines })));
+      }
+      const text = danglingReport({
+        missing,
+        ambiguous: found.ambiguous,
+        checkedWith: found.checkedWith,
+        keys: keys.length,
+        notes,
+        when: window.moment ? window.moment().format('YYYY-MM-DD HH:mm') : new Date().toISOString(),
+      });
+      if (!reportPath.endsWith('.md')) {
+        new Notice(`Dangling citation keys: the report note "${reportPath}" must end in .md (Settings → Zotero Cite Links Enhanced).`, 10000);
+        return;
+      }
+      const existing = this.app.vault.getAbstractFileByPath(reportPath);
+      if (existing && !(existing instanceof TFile)) {
+        new Notice(`Dangling citation keys: "${reportPath}" is a folder; choose another report note in the settings.`, 10000);
+        return;
+      }
+      let file;
+      if (existing) {
+        file = existing;
+        await this.app.vault.modify(existing, text);
+      } else {
+        file = await this.app.vault.create(reportPath, text);
+      }
+      await this.app.workspace.getLeaf('tab').openFile(file, { active: true });
+      new Notice(`${found.missing.size} dangling citation key${found.missing.size === 1 ? '' : 's'} of ${keys.length}: see ${reportPath}.`);
+    } catch (e) {
+      console.error('zotero-cite-links: listing dangling keys', e);
+      new Notice(`Dangling citation keys: the listing failed (${e && e.message ? e.message : e}). See the developer console.`, 10000);
+    } finally {
+      notice.hide();
+    }
   }
 
   // ---- Citation pop-ups ----
@@ -550,8 +952,20 @@ module.exports = class ZoteroCiteLinks extends Plugin {
     return evt.key === (Platform.isMacOS ? 'Meta' : 'Control');
   }
 
+  // Ctrl/Cmd + hover shows the source's note instead of the entry.
+  previewsNote() {
+    return this.settings.hoverPopup && this.settings.previewChoice === 'note';
+  }
+
   onBibMouseMove = (evt) => {
     this.bibPointer = { x: evt.clientX, y: evt.clientY };
+    this.lastPointerEvent = evt;
+    if (this.previewsNote()) {
+      const noteEl = this.isHoverModifier(evt) ? this.citeElFromTarget(evt.target) : null;
+      if (noteEl) this.previewSourceNote(noteEl, evt);
+      else this.previewEl = null;
+      return;
+    }
     if (!this.settings.hoverPopup) return;
     // over the pop-up: it stays, so that its text can be selected and copied
     if (this.bibPopup && evt.target instanceof Node && this.bibPopup.contains(evt.target)) {
@@ -564,6 +978,18 @@ module.exports = class ZoteroCiteLinks extends Plugin {
   };
 
   onBibKeyDown = (evt) => {
+    // Ctrl/Cmd pressed with the pointer already resting on a citation: its note previewed
+    if (this.previewsNote()) {
+      if (this.isHoverModifierKey(evt) && !evt.repeat && this.bibPointer) {
+        const { x, y } = this.bibPointer;
+        const el = this.citeElFromTarget(document.elementFromPoint(x, y));
+        if (el) {
+          this.previewEl = null;
+          this.previewSourceNote(el, this.lastPointerEvent || evt);
+        }
+      }
+      return;
+    }
     if (!this.settings.hoverPopup) return;
     // Ctrl/Cmd+Shift+C: the entry shown, copied as found
     if (this.isHoverModifier(evt) && evt.shiftKey && evt.key.toLowerCase() === 'c' && this.bibPopup && this.bibShown) {
@@ -773,22 +1199,8 @@ class ZCLSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Click modifier')
-      .setDesc('Which click opens the citation in Zotero.')
-      .addDropdown((d) =>
-        d
-          .addOption('mod', 'Cmd / Ctrl + click')
-          .addOption('none', 'Plain click')
-          .setValue(this.plugin.settings.modifier)
-          .onChange(async (v) => {
-            this.plugin.settings.modifier = v;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName('Citation pop-ups')
-      .setDesc('Hold Ctrl (Cmd on macOS) and point at a citation to see its bibliography entry, from a .bib file in the vault or else from Zotero on this computer. Ctrl/Cmd+Shift+C copies the entry shown.')
+      .setDesc('Hold Ctrl (Cmd on macOS) and point at a citation to see a preview of it; what the preview shows is set by "Preview choice" below.')
       .addToggle((t) =>
         t
           .setValue(this.plugin.settings.hoverPopup)
@@ -798,7 +1210,64 @@ class ZCLSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
+
+    new Setting(containerEl)
+      .setName('Preview choice')
+      .setDesc('What Ctrl/Cmd + hover over a citation shows. "Zotero Bib": its bibliography entry, from Zotero on this computer (Better BibTeX) or else from a .bib file in the vault; Ctrl/Cmd+Shift+C copies the entry shown. "Library note": the source\'s own note in the vault, scrolled to the page cited, in Obsidian\'s page preview (the core plugin Page preview must be on); this needs no Zotero.')
+      .addDropdown((d) =>
+        d
+          .addOption('bib', 'Zotero Bib')
+          .addOption('note', 'Library note')
+          .setValue(this.plugin.settings.previewChoice)
+          .onChange(async (v) => {
+            this.plugin.settings.previewChoice = v;
+            this.plugin.hideBibPopup();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Source notes')
+      .setDesc('A click on a citation (without Ctrl/Cmd) opens the note in the vault whose citekey property is the citation\'s key (a long source\'s contents note), at the page cited, when the note marks its pages with <!-- page N … --> comments; a notice says when no note has the key. It reads only the vault, so Zotero need not be running. Ctrl/Cmd + click still opens the citation in Zotero. Turn this off if a click on a citation should place the cursor as usual.')
+      .addToggle((t) =>
+        t
+          .setValue(this.plugin.settings.sourceNotes)
+          .onChange(async (v) => {
+            this.plugin.settings.sourceNotes = v;
+            this.plugin.clearModClass();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Dangling keys: folders to skip')
+      .setDesc('The command "List dangling citation keys" reads every note for @keys and asks Zotero which have no item. Folders listed here (one per line, as vault paths) are not read: for example the folder of the sources\' own notes, whose text holds @ signs that are not citations. Empty reads every note.')
+      .addTextArea((t) =>
+        t
+          .setPlaceholder('Sources\nTemplates')
+          .setValue(this.plugin.settings.danglingSkip)
+          .onChange(async (v) => {
+            this.plugin.settings.danglingSkip = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Dangling keys: report note')
+      .setDesc('The note the command writes its list to (replaced each time it runs), as a vault path ending in .md. Default: "Dangling citation keys.md" at the top of the vault.')
+      .addText((t) =>
+        t
+          .setPlaceholder(DEFAULT_SETTINGS.danglingReport)
+          .setValue(this.plugin.settings.danglingReport)
+          .onChange(async (v) => {
+            this.plugin.settings.danglingReport = v.trim() || DEFAULT_SETTINGS.danglingReport;
+            await this.plugin.saveSettings();
+          })
+      );
   }
 }
+
+// The pure functions, for the tests in tests/run.js (not used by Obsidian).
+module.exports.internals = { markerLine, citableText, citationsIn, skipFolders, inFolders, danglingReport };
 
 /* nosourcemap */
